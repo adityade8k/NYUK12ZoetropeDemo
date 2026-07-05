@@ -102,8 +102,24 @@
       import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
       const TARGET_LOOP_SECONDS = 1;
-      const FRAME_DIR = "frames/";
-      const IMAGE_EXTENSIONS = /\.(png|jpe?g|webp|gif|avif)$/i;
+      const FRAME_URLS = [
+        "./frames/ezgif-frame-001.png",
+        "./frames/ezgif-frame-002.png",
+        "./frames/ezgif-frame-003.png",
+        "./frames/ezgif-frame-004.png",
+        "./frames/ezgif-frame-005.png",
+        "./frames/ezgif-frame-006.png",
+        "./frames/ezgif-frame-007.png",
+        "./frames/ezgif-frame-008.png",
+        "./frames/ezgif-frame-009.png",
+        "./frames/ezgif-frame-010.png",
+        "./frames/ezgif-frame-011.png",
+        "./frames/ezgif-frame-012.png",
+        "./frames/ezgif-frame-013.png",
+        "./frames/ezgif-frame-014.png",
+        "./frames/ezgif-frame-015.png",
+        "./frames/ezgif-frame-016.png"
+      ];
       const TAU = Math.PI * 2;
 
       const app = document.querySelector("#app");
@@ -147,12 +163,10 @@
       let accelerating = false;
       let currentFrameRate = 0;
       let frameCount = 0;
-      let frameTextures = [];
       let frameSizes = [];
-      let viewingFrame = null;
-      let viewingFrameMaterial = null;
-      let viewingFrameBorder = null;
-      let lastViewedFrameIndex = -1;
+      let frameStep = 0;
+      let frameStepAccumulator = 0;
+      let currentStepIndex = 0;
       const acceleration = 4.4;
       const braking = 1.65;
       const clock = new THREE.Clock();
@@ -166,14 +180,14 @@
       async function init() {
         const frameUrls = await discoverFrames();
         if (frameUrls.length === 0) {
-          throw new Error("No image frames found in /frames. Serve this folder locally so the browser can read the directory listing.");
+          throw new Error("No image frames configured. Check the FRAME_URLS list in index.html.");
         }
 
         statusEl.textContent = "Loading textures...";
         frameCount = frameUrls.length;
         frameCountEl.textContent = `Frames: ${frameCount}`;
 
-        frameTextures = await Promise.all(frameUrls.map(loadTexture));
+        const frameTextures = await Promise.all(frameUrls.map(loadTexture));
         buildZoetrope(frameTextures);
 
         targetAngularVelocity = TAU / TARGET_LOOP_SECONDS;
@@ -199,26 +213,7 @@
       }
 
       async function discoverFrames() {
-        const response = await fetch(FRAME_DIR);
-        if (!response.ok) {
-          throw new Error(`Could not read ${FRAME_DIR}. Start a local web server from the project root.`);
-        }
-
-        const html = await response.text();
-        const doc = new DOMParser().parseFromString(html, "text/html");
-        const frameBase = new URL(FRAME_DIR, window.location.href);
-        const links = [...doc.querySelectorAll("a")]
-          .map((link) => link.getAttribute("href"))
-          .filter(Boolean)
-          .map((href) => new URL(href, frameBase))
-          .filter((url) => url.pathname.startsWith(frameBase.pathname) && IMAGE_EXTENSIONS.test(url.pathname))
-          .map((url) => url.href);
-
-        return [...new Set(links)].sort(naturalFrameSort);
-      }
-
-      function naturalFrameSort(a, b) {
-        return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+        return FRAME_URLS.map((path) => new URL(path, window.location.href).href);
       }
 
       function loadTexture(url) {
@@ -268,45 +263,8 @@
           ring.add(plane);
         });
 
-        addViewingFrame(radius, textures[0]);
         addStructure(radius, planeHeight);
-      }
-
-      function addViewingFrame(radius, texture) {
-        viewingFrameMaterial = new THREE.MeshBasicMaterial({
-          map: texture,
-          side: THREE.FrontSide,
-          toneMapped: false
-        });
-        viewingFrame = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), viewingFrameMaterial);
-        viewingFrame.position.set(0, 0, radius + 0.42);
-        scene.add(viewingFrame);
-
-        viewingFrameBorder = new THREE.LineSegments(
-          new THREE.EdgesGeometry(new THREE.PlaneGeometry(1, 1)),
-          new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 })
-        );
-        viewingFrameBorder.position.copy(viewingFrame.position);
-        scene.add(viewingFrameBorder);
-
-        setViewingFrame(0);
-      }
-
-      function setViewingFrame(index) {
-        if (!viewingFrame || index === lastViewedFrameIndex) return;
-
-        const texture = frameTextures[index];
-        const size = frameSizes[index];
-        viewingFrameMaterial.map = texture;
-        viewingFrameMaterial.needsUpdate = true;
-        viewingFrame.scale.set(size.width, size.height, 1);
-        viewingFrameBorder.scale.set(size.width * 1.03, size.height * 1.03, 1);
-        lastViewedFrameIndex = index;
-      }
-
-      function getCurrentViewedFrameIndex() {
-        const normalizedRotation = THREE.MathUtils.euclideanModulo(ring.rotation.y, TAU);
-        return THREE.MathUtils.euclideanModulo(Math.round((-normalizedRotation / TAU) * frameCount), frameCount);
+        frameStep = TAU / textures.length;
       }
 
       function addStructure(radius, planeHeight) {
@@ -344,9 +302,16 @@
           angularVelocity = Math.max(0, angularVelocity - braking * dt);
         }
 
-        ring.rotation.y += angularVelocity * dt;
-        if (frameCount > 0) {
-          setViewingFrame(getCurrentViewedFrameIndex());
+        if (frameCount > 0 && angularVelocity > 0) {
+          frameStepAccumulator += (angularVelocity / frameStep) * dt;
+          const stepsToAdvance = Math.floor(frameStepAccumulator);
+          if (stepsToAdvance > 0) {
+            frameStepAccumulator -= stepsToAdvance;
+            currentStepIndex = (currentStepIndex + stepsToAdvance) % frameCount;
+            ring.rotation.y = currentStepIndex * frameStep;
+          }
+        } else {
+          frameStepAccumulator = 0;
         }
 
         currentFrameRate = angularVelocity === 0 ? 0 : (angularVelocity / TAU) * frameCount;
