@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Three.js Zoetrope</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #0d0f12;
+        color: #f5f5f5;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        overflow: hidden;
+      }
+
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+
+      .hud {
+        position: fixed;
+        left: 20px;
+        top: 18px;
+        z-index: 2;
+        display: grid;
+        gap: 6px;
+        max-width: min(420px, calc(100vw - 40px));
+        color: #f8fafc;
+        text-shadow: 0 1px 14px rgba(0, 0, 0, 0.6);
+        pointer-events: none;
+      }
+
+      .hud h1 {
+        margin: 0;
+        font-size: clamp(22px, 3vw, 34px);
+        font-weight: 720;
+        letter-spacing: 0;
+      }
+
+      .hud p {
+        margin: 0;
+        color: #d8dde5;
+        font-size: 14px;
+        line-height: 1.45;
+      }
+
+      .stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 6px;
+      }
+
+      .pill {
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        border-radius: 999px;
+        padding: 6px 10px;
+        background: rgba(13, 15, 18, 0.58);
+        font-size: 12px;
+        color: #eef2f7;
+        backdrop-filter: blur(10px);
+      }
+
+      .error {
+        color: #fecaca;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main id="app" aria-label="Three.js zoetrope viewer"></main>
+    <section class="hud">
+      <h1>Zoetrope</h1>
+      <p id="status">Loading frames...</p>
+      <div class="stats">
+        <span class="pill" id="frame-count">Frames: --</span>
+        <span class="pill" id="speed">Speed: 0 fps</span>
+        <span class="pill" id="target-speed">Target: --</span>
+        <span class="pill">Hold Space to accelerate</span>
+      </div>
+    </section>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+      const TARGET_LOOP_SECONDS = 1;
+      const FRAME_DIR = "frames/";
+      const IMAGE_EXTENSIONS = /\.(png|jpe?g|webp|gif|avif)$/i;
+      const TAU = Math.PI * 2;
+
+      const app = document.querySelector("#app");
+      const statusEl = document.querySelector("#status");
+      const frameCountEl = document.querySelector("#frame-count");
+      const speedEl = document.querySelector("#speed");
+      const targetSpeedEl = document.querySelector("#target-speed");
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0d0f12);
+      scene.fog = new THREE.Fog(0x0d0f12, 14, 34);
+
+      const camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 0.1, 100);
+      camera.position.set(0, 2.1, 12);
+      camera.lookAt(0, 0.4, 0);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      app.appendChild(renderer.domElement);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.target.set(0, 0.35, 0);
+      controls.minDistance = 4;
+      controls.maxDistance = 42;
+      controls.update();
+
+      const keyLight = new THREE.DirectionalLight(0xffffff, 2.2);
+      keyLight.position.set(4, 7, 8);
+      scene.add(keyLight);
+      scene.add(new THREE.HemisphereLight(0xb7c7ff, 0x15100d, 1.35));
+
+      const ring = new THREE.Group();
+      scene.add(ring);
+
+      let targetAngularVelocity = 0;
+      let angularVelocity = 0;
+      let accelerating = false;
+      let currentFrameRate = 0;
+      let frameCount = 0;
+      let frameTextures = [];
+      let frameSizes = [];
+      let viewingFrame = null;
+      let viewingFrameMaterial = null;
+      let viewingFrameBorder = null;
+      let lastViewedFrameIndex = -1;
+      const acceleration = 4.4;
+      const braking = 1.65;
+      const clock = new THREE.Clock();
+
+      init().catch((error) => {
+        console.error(error);
+        statusEl.textContent = error.message;
+        statusEl.classList.add("error");
+      });
+
+      async function init() {
+        const frameUrls = await discoverFrames();
+        if (frameUrls.length === 0) {
+          throw new Error("No image frames found in /frames. Serve this folder locally so the browser can read the directory listing.");
+        }
+
+        statusEl.textContent = "Loading textures...";
+        frameCount = frameUrls.length;
+        frameCountEl.textContent = `Frames: ${frameCount}`;
+
+        frameTextures = await Promise.all(frameUrls.map(loadTexture));
+        buildZoetrope(frameTextures);
+
+        targetAngularVelocity = TAU / TARGET_LOOP_SECONDS;
+        targetSpeedEl.textContent = `Target: ${(frameCount / TARGET_LOOP_SECONDS).toFixed(1)} fps`;
+        statusEl.textContent = "Ready. Hold Space to accelerate.";
+
+        window.addEventListener("keydown", (event) => {
+          if (event.code !== "Space" || event.repeat) return;
+          event.preventDefault();
+          accelerating = true;
+          statusEl.textContent = "Accelerating.";
+        });
+
+        window.addEventListener("keyup", (event) => {
+          if (event.code !== "Space") return;
+          event.preventDefault();
+          accelerating = false;
+          statusEl.textContent = "Coasting.";
+        });
+
+        window.addEventListener("resize", resize);
+        animate();
+      }
+
+      async function discoverFrames() {
+        const response = await fetch(FRAME_DIR);
+        if (!response.ok) {
+          throw new Error(`Could not read ${FRAME_DIR}. Start a local web server from the project root.`);
+        }
+
+        const html = await response.text();
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        const frameBase = new URL(FRAME_DIR, window.location.href);
+        const links = [...doc.querySelectorAll("a")]
+          .map((link) => link.getAttribute("href"))
+          .filter(Boolean)
+          .map((href) => new URL(href, frameBase))
+          .filter((url) => url.pathname.startsWith(frameBase.pathname) && IMAGE_EXTENSIONS.test(url.pathname))
+          .map((url) => url.href);
+
+        return [...new Set(links)].sort(naturalFrameSort);
+      }
+
+      function naturalFrameSort(a, b) {
+        return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+      }
+
+      function loadTexture(url) {
+        const loader = new THREE.TextureLoader();
+        return new Promise((resolve, reject) => {
+          loader.load(
+            url,
+            (texture) => {
+              texture.colorSpace = THREE.SRGBColorSpace;
+              texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+              texture.userData.url = url;
+              resolve(texture);
+            },
+            undefined,
+            () => reject(new Error(`Failed to load ${url}`))
+          );
+        });
+      }
+
+      function buildZoetrope(textures) {
+        const planeHeight = 3.25;
+        frameSizes = textures.map((texture) => {
+          const aspect = texture.image.naturalWidth / texture.image.naturalHeight;
+          return { width: planeHeight * aspect, height: planeHeight };
+        });
+        const maxPlaneWidth = Math.max(...frameSizes.map((size) => size.width));
+        const radius = Math.max(4.2, (maxPlaneWidth * textures.length) / (TAU * 0.82));
+
+        camera.position.z = Math.max(10, radius + 7);
+        camera.position.y = Math.max(2.1, radius * 0.25);
+        controls.target.set(0, 0.35, 0);
+        controls.update();
+
+        textures.forEach((texture, index) => {
+          const angle = (index / textures.length) * TAU;
+          const size = frameSizes[index];
+          const geometry = new THREE.PlaneGeometry(size.width, size.height);
+          const material = new THREE.MeshBasicMaterial({
+            map: texture,
+            side: THREE.DoubleSide,
+            toneMapped: false
+          });
+          const plane = new THREE.Mesh(geometry, material);
+
+          plane.position.set(Math.sin(angle) * radius, 0, Math.cos(angle) * radius);
+          plane.rotation.y = angle;
+          ring.add(plane);
+        });
+
+        addViewingFrame(radius, textures[0]);
+        addStructure(radius, planeHeight);
+      }
+
+      function addViewingFrame(radius, texture) {
+        viewingFrameMaterial = new THREE.MeshBasicMaterial({
+          map: texture,
+          side: THREE.FrontSide,
+          toneMapped: false
+        });
+        viewingFrame = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), viewingFrameMaterial);
+        viewingFrame.position.set(0, 0, radius + 0.42);
+        scene.add(viewingFrame);
+
+        viewingFrameBorder = new THREE.LineSegments(
+          new THREE.EdgesGeometry(new THREE.PlaneGeometry(1, 1)),
+          new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 })
+        );
+        viewingFrameBorder.position.copy(viewingFrame.position);
+        scene.add(viewingFrameBorder);
+
+        setViewingFrame(0);
+      }
+
+      function setViewingFrame(index) {
+        if (!viewingFrame || index === lastViewedFrameIndex) return;
+
+        const texture = frameTextures[index];
+        const size = frameSizes[index];
+        viewingFrameMaterial.map = texture;
+        viewingFrameMaterial.needsUpdate = true;
+        viewingFrame.scale.set(size.width, size.height, 1);
+        viewingFrameBorder.scale.set(size.width * 1.03, size.height * 1.03, 1);
+        lastViewedFrameIndex = index;
+      }
+
+      function getCurrentViewedFrameIndex() {
+        const normalizedRotation = THREE.MathUtils.euclideanModulo(ring.rotation.y, TAU);
+        return THREE.MathUtils.euclideanModulo(Math.round((-normalizedRotation / TAU) * frameCount), frameCount);
+      }
+
+      function addStructure(radius, planeHeight) {
+        const ringMaterial = new THREE.MeshStandardMaterial({
+          color: 0xc8d0d8,
+          roughness: 0.42,
+          metalness: 0.55
+        });
+        const top = new THREE.Mesh(new THREE.TorusGeometry(radius, 0.035, 12, 160), ringMaterial);
+        const bottom = top.clone();
+        top.rotation.x = Math.PI / 2;
+        bottom.rotation.x = Math.PI / 2;
+        top.position.y = planeHeight / 2 + 0.18;
+        bottom.position.y = -planeHeight / 2 - 0.18;
+        ring.add(top, bottom);
+
+        const axle = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, planeHeight + 1.35, 32), ringMaterial);
+        ring.add(axle);
+
+        const base = new THREE.Mesh(
+          new THREE.CylinderGeometry(radius * 0.32, radius * 0.42, 0.12, 96),
+          new THREE.MeshStandardMaterial({ color: 0x242930, roughness: 0.65, metalness: 0.2 })
+        );
+        base.position.y = -planeHeight / 2 - 0.5;
+        scene.add(base);
+      }
+
+      function animate() {
+        requestAnimationFrame(animate);
+        const dt = Math.min(clock.getDelta(), 0.05);
+
+        if (accelerating) {
+          angularVelocity = Math.min(targetAngularVelocity, angularVelocity + acceleration * dt);
+        } else {
+          angularVelocity = Math.max(0, angularVelocity - braking * dt);
+        }
+
+        ring.rotation.y += angularVelocity * dt;
+        if (frameCount > 0) {
+          setViewingFrame(getCurrentViewedFrameIndex());
+        }
+
+        currentFrameRate = angularVelocity === 0 ? 0 : (angularVelocity / TAU) * frameCount;
+        speedEl.textContent = `Speed: ${currentFrameRate.toFixed(1)} fps`;
+
+        if (accelerating && angularVelocity === targetAngularVelocity) {
+          statusEl.textContent = "At calculated max speed.";
+        } else if (!accelerating && angularVelocity === 0) {
+          statusEl.textContent = "Idle. Hold Space to accelerate.";
+        }
+
+        controls.update();
+        renderer.render(scene, camera);
+      }
+
+      function resize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+    </script>
+  </body>
+</html>
